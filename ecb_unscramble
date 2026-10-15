@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+Lab 06 - Encrypted Image (AES-ECB) solver
+-----------------------------------------
+Reveals the picture hidden in an AES-ECB encrypted BMP WITHOUT the key.
+
+Why it works: ECB encrypts every 16-byte block independently with the same key,
+so identical plaintext blocks (e.g. the plain white background) become identical
+ciphertext blocks. We find the most common block (= background) and paint it
+white, and everything else black. The flag text appears.
+
+Usage:
+    python ecb_unscramble.py aes.bmp.enc
+    python ecb_unscramble.py aes.bmp.enc --width 640 --height 480
+
+Outputs (written next to where you run the script):
+    step1_header_swap.bmp  - ciphertext with a valid BMP header glued on (classic method)
+    step2_mask.png         - clean black/white image of the flag
+    step3_mask_centered.png- same, shifted so the text isn't split across the edge
+"""
+import argparse
+import struct
+import sys
+from collections import Counter
+
+import numpy as np
+from PIL import Image
+
+BLOCK = 16          # AES block size in bytes
+HEADER = 54         # size of a standard BMP header (14 file + 40 info)
+
+
+def make_bmp_header(width, height):
+    """Build a valid 54-byte header for a 24-bit BMP of the given size."""
+    row = (width * 3 + 3) & ~3                       # rows are padded to 4 bytes
+    img_size = row * height
+    file_hdr = struct.pack('<2sIHHI', b'BM', HEADER + img_size, 0, 0, HEADER)
+    info_hdr = struct.pack('<IiiHHIIiiII', 40, width, height, 1, 24, 0,
+                           img_size, 2835, 2835, 0, 0)
+    return file_hdr + info_hdr
+
+
+def repair_utf8_damage(data):
+    """If the file was saved as text, every byte >= 0x80 became EF BF BD.
+    Turn each of those back into a single (placeholder) byte so the length
+    and row positions are roughly right again."""
+    text = data.decode('utf-8', errors='replace')
+    out = bytearray()
+    for ch in text:
+        out += b'\x80' if ch == '�' else ch.encode('utf-8')
+    return bytes(out)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('file')
+    ap.add_argument('--width', type=int, default=640)
+    ap.add_argument('--height', type=int, default=480)
+    ap.add_argument('--shift', type=int, default=-40,
+                    help='pixels to slide the image sideways (negative = left)')
+    args = ap.parse_args()
+    W_PX, H_PX = args.width, args.height
+    ROW = W_PX * 3                                   # bytes per pixel row
+
+    data = open(args.file, 'rb').read()
+    print(f'[1] Read {len(data):,} bytes from {args.file}')
+    print(f'    Expected about {HEADER + ROW * H_PX:,} bytes for {W_PX}x{H_PX} 24-bit')
+
+    # ---- Check for text-mode corruption ---------------------------------
+    damage = data.count(b'\xef\xbf\xbd')
+    damaged = damage > 1000
+    if damaged:
+        print(f'[!] Found {damage:,} "EF BF BD" sequences: the file was saved as TEXT')
+        print('    and has been damaged. Repairing as best we can...')
+        data = repair_utf8_damage(data)
+        print(f'    After repair: {len(data):,} bytes')
+
+    # ---- Step 1: prove it is ECB by counting repeated blocks ------------
+    blocks = [data[i:i + BLOCK] for i in range(0, len(data) - BLOCK + 1, BLOCK)]
+    uniq = len(set(blocks))
+    print(f'[2] {len(blocks):,} aligned 16-byte blocks, {uniq:,} unique')
+    print(f'    {100 * (1 - uniq / len(blocks)):.1f}% are repeats  ->  ECB mode leaks patterns')
+
+    # ---- Classic method: glue a real BMP header onto the ciphertext -----
+    body = data[HEADER:HEADER + ROW * H_PX].ljust(ROW * H_PX, b'\0')
+    open('step1_header_swap.bmp', 'wb').write(make_bmp_header(W_PX, H_PX) + body)
+    print('[3] Wrote step1_header_swap.bmp (open it in any image viewer)')
+
+    # ---- Find the background block (most common 16 bytes) ---------------
+    if damaged:
+        # alignment is broken, so check the block starting at EVERY offset
+        counts = Counter(data[i:i + BLOCK] for i in range(len(data) - BLOCK))
+    else:
+        counts = Counter(blocks)
+    bg, hits = counts.most_common(1)[0]
+    print(f'[4] Background block = {bg.hex()}  ({hits:,} occurrences)')
+
+    # ---- Build a byte mask: 1 = background, 0 = "ink" -------------------
+    mask = np.zeros(len(data), dtype=np.uint8)
+    start = 0
+    while True:
+        i = data.find(bg, start)
+        if i < 0:
+            break
+        mask[i:i + BLOCK] = 1
+        start = i + 1
+    print(f'    {mask.mean() * 100:.1f}% of bytes are background')
+
+    # ---- Lay the mask out as rows ---------------------------------------
+    rows, pos = [], HEADER
+    while pos + ROW <= len(mask) and len(rows) < H_PX:
+        row = mask[pos:pos + ROW]
+        rows.append(row)
+        if damaged:
+            # lost bytes make rows drift; choose the next-row start that
+            # best lines up with this row (neighbouring rows look alike)
+            best_L, best_d = ROW, None
+            for L in range(ROW - 80, ROW + 4):
+                s = pos + L
+                if s + 1800 > len(mask):
+                    break
+                d = np.count_nonzero(mask[s:s + 1800] != row[:1800])
+                if best_d is None or d < best_d or (d == best_d and L == ROW):
+                    best_L, best_d = L, d
+            pos += best_L
+        else:
+            pos += ROW
+
+    img = np.array(rows, dtype=np.uint8) * 255        # white = background
+    img = img.reshape(len(rows), W_PX, 3).min(axis=2)  # 3 bytes -> 1 pixel
+    img = np.flipud(img)                               # BMP rows are bottom-up
+    Image.fromarray(img).save('step2_mask.png')
+    print('[5] Wrote step2_mask.png')
+
+    # ---- Shift sideways so the text isn't split across the edge ---------
+    # np.roll slides the picture left/right, wrapping pixels around the edge
+    Image.fromarray(np.roll(img, args.shift, axis=1)).save('step3_mask_centered.png')
+    print(f'[6] Wrote step3_mask_centered.png (shift={args.shift})  <-- read the flag here')
+    print('    If the word is still split, re-run with a different --shift, e.g. --shift 100')
+
+
+if __name__ == '__main__':
+    main()
